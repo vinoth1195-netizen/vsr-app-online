@@ -56,10 +56,12 @@ def show_connect_qr():
     st.sidebar.subheader("📱 Connect Mobile/iPad")
     try:
         qr = qrcode.make(url)
-        st.sidebar.image(qr.get_image(), width=150)
+        # Convert QR to image for Streamlit
+        img_byte_arr = io.BytesIO()
+        qr.save(img_byte_arr, format='PNG')
+        st.sidebar.image(img_byte_arr.getvalue(), width=150)
     except:
-        qr = qrcode.make(url)
-        st.sidebar.image(qr, width=150)
+        st.sidebar.warning("QR Error")
     st.sidebar.caption(f"Scan or type: **{url}**")
 
 # CUSTOM CSS
@@ -93,8 +95,10 @@ st.markdown("""
 
 # LOGIN BG
 if os.path.exists("logo.png") and 'auth' not in st.session_state:
-    bin_str = get_base64_of_bin_file("logo.png")
-    st.markdown(f"""<style>.stApp {{ background-image: linear-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.9)), url("data:image/png;base64,{bin_str}"); background-size: 50%; background-position: center; background-repeat: no-repeat; background-attachment: fixed; }}</style>""", unsafe_allow_html=True)
+    try:
+        bin_str = get_base64_of_bin_file("logo.png")
+        st.markdown(f"""<style>.stApp {{ background-image: linear-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.9)), url("data:image/png;base64,{bin_str}"); background-size: 50%; background-position: center; background-repeat: no-repeat; background-attachment: fixed; }}</style>""", unsafe_allow_html=True)
+    except: pass
 
 # ==========================================
 # 2. DATABASE SETUP
@@ -239,14 +243,7 @@ def create_pdf(sale, items, customer, gst, addr, phone):
     due = sale['grand_total'] - sale['paid_amount']
     if due > 0.01: tr("Balance Due:", due, True)
     
-    temp_inv = f"temp_inv_{sale['id']}.pdf"
-    pdf.output(temp_inv, "F")
-    with open(temp_inv, "rb") as f:
-        pdf_bytes = f.read()
-    try: os.remove(temp_inv)
-    except: pass
-    
-    return pdf_bytes
+    return pdf.output(dest="S").encode("latin-1")
 
 def create_pnl_pdf(d1, d2, rev, cogs, exp_data, net):
     pdf = FPDF()
@@ -275,12 +272,7 @@ def create_pnl_pdf(d1, d2, rev, cogs, exp_data, net):
     pdf.ln(5)
     pdf.set_fill_color(220, 255, 220) 
     pdf.cell(100, 12, "NET PROFIT", 1, 0, 'L', True); pdf.cell(50, 12, f"{net:,.2f}", 1, 1, 'R', True)
-    temp_file = "temp_pnl.pdf"
-    pdf.output(temp_file, "F")
-    with open(temp_file, "rb") as f: bytes_data = f.read()
-    try: os.remove(temp_file)
-    except: pass
-    return bytes_data
+    return pdf.output(dest="S").encode("latin-1")
 
 # --- IMAGE STICKER GENERATOR ---
 def create_sticker_image(thickness_val, title_text, cell_number):
@@ -314,7 +306,7 @@ def create_sticker_image(thickness_val, title_text, cell_number):
 
     if not title_drawn:
         font_path = None
-        possible = ["Nirmala.ttf", "tamil.ttf", "C:/Windows/Fonts/Nirmala.ttf", "C:/Windows/Fonts/Latha.ttf", "arial.ttf"]
+        possible = ["Nirmala.ttf", "tamil.ttf", "arial.ttf"]
         for p in possible:
             if os.path.exists(p):
                 font_path = p; break
@@ -331,7 +323,7 @@ def create_sticker_image(thickness_val, title_text, cell_number):
             text_y = int(25 + (155 - text_h) / 2) - 15
             draw.text((text_x, text_y), title_text, font=title_font, fill=(0,0,0))
         except:
-            draw.text((100, 75), "Nool Kandu", fill=(0,0,0))
+            draw.text((100, 75), title_text, fill=(0,0,0))
 
     if os.path.exists("logo.png"):
         try:
@@ -393,18 +385,10 @@ def generate_pdf_from_images(thickness_val, num_sheets, title_text, cell_text):
                 y = margin_y + (i * sticker_h)
                 pdf.image(temp_img_path, x=x, y=y, w=sticker_w, h=sticker_h)
                 
-    out_file = "final_stickers.pdf"
-    pdf.output(out_file, "F")
-    
-    with open(out_file, "rb") as f:
-         pdf_bytes = f.read()
-
-    # --- ADDED DOWNLOAD BUTTON LOGIC HERE ---
-    
-    try: os.remove(temp_img_path); os.remove(out_file)
+    try: os.remove(temp_img_path)
     except: pass
     
-    return pdf_bytes
+    return pdf.output(dest="S").encode("latin-1")
 
 # ==========================================
 # 3. MAIN APP FLOW
@@ -592,7 +576,7 @@ elif menu == "Sales & Billing":
                 paid = st.number_input("Paid", 0.0, value=grand, key="sales_paid"); note = st.text_input("Note", key="sales_note")
                 if st.button("✅ Confirm Sale", type="primary", use_container_width=True, key="sales_confirm"):
                     sid = run_query("INSERT INTO sales (date, customer_id, sub_total, cgst_percent, sgst_percent, cgst_amount, sgst_amount, grand_total, paid_amount, notes, walkin_phone) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                              (d_inv, c_id, taxable, cp, sp, taxable*(cp/100), taxable*(sp/100), grand, paid, note, walkin_mob))
+                                    (d_inv, c_id, taxable, cp, sp, taxable*(cp/100), taxable*(sp/100), grand, paid, note, walkin_mob))
                     for x in st.session_state.cart: run_query("INSERT INTO sale_items (sale_id, item_id, qty, price_per_unit, cost_per_unit) VALUES (?,?,?,?,?)", (sid, x['id'], x['qty'], x['price'], x['cost']))
                     if paid > 0: run_query("INSERT INTO payments (date, customer_id, sale_id, amount, note) VALUES (?,?,?,?,?)", (d_inv, c_id, sid, paid, "Sale"))
                     st.session_state.cart = []; st.success("Saved!"); st.rerun()
@@ -637,10 +621,10 @@ elif menu == "Sales & Billing":
                     msg += "------------------------------\n"
                     msg += "*Item Details:*\n"
                     for item in its:
-                         iname = item['name'] if 'name' in item.keys() else 'Item'
-                         clr = item['color'] if 'color' in item.keys() else ''
-                         tot_line = item['qty'] * item['price_per_unit']
-                         msg += f"• {iname} {clr} (x{item['qty']}): ₹{tot_line:,.0f}\n"
+                          iname = item['name'] if 'name' in item.keys() else 'Item'
+                          clr = item['color'] if 'color' in item.keys() else ''
+                          tot_line = item['qty'] * item['price_per_unit']
+                          msg += f"• {iname} {clr} (x{item['qty']}): ₹{tot_line:,.0f}\n"
                     msg += "------------------------------\n"
                     msg += f"*GRAND TOTAL: ₹{inv['grand_total']:,.0f}*\n"
                     msg += "------------------------------\n"
@@ -1016,35 +1000,29 @@ elif menu == "Print Stickers":
     st_title = st.text_input("Sticker Title", value="நூல் கண்டு")
     st_cell = st.text_input("Cell Number", value="7418570821")
     
-    # Priority: Image (title.png) > Text
-    if os.path.exists("title.png"):
-        st.success("✅ Image title found (title.png). Using image instead of text.")
-    elif not os.path.exists("tamil.ttf"):
-        st.warning("⚠️ For Tamil text, please add 'tamil.ttf' or 'Nirmala.ttf' to the app folder. Currently using system defaults.")
-
     c1, c2 = st.columns(2)
     t_val = c1.number_input("Thread Thickness Value", 1, value=6)
     n_sheets = c2.number_input("Number of Sheets (9 stickers/sheet)", 1, value=1)
     
+    # 1. BUTTON TO GENERATE
     if st.button("Generate Sticker PDF", type="primary"):
+        # Generate and Store in Session State
         pdf_bytes = generate_pdf_from_images(t_val, n_sheets, st_title, st_cell)
-        
-        # 1. Base64 Preview
-        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="900" type="application/pdf"></iframe>'
-        
-        st.markdown("### 🖨️ Sticker Preview")
-        st.markdown(pdf_display, unsafe_allow_html=True)
-        
-        # 2. Download Button
+        st.session_state.sticker_pdf = pdf_bytes
+        st.success("✅ Sticker generated successfully! Click below to download.")
+
+    # 2. SHOW DOWNLOAD BUTTON IF FILE EXISTS
+    if 'sticker_pdf' in st.session_state:
         st.download_button(
-            label="⬇️ Download PDF",
-            data=pdf_bytes,
+            label="⬇️ Click here to Download Sticker PDF",
+            data=st.session_state.sticker_pdf,
             file_name="sticker.pdf",
             mime="application/pdf"
         )
-    
-    st.info("💡 Pro Tip: For perfect Tamil text, you can upload an image of the text named 'title.png' to the app folder.")
+        # Optional: Show preview iframe (Safe version)
+        b64 = base64.b64encode(st.session_state.sticker_pdf).decode()
+        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
+
 
 elif menu == "Data Inspector":
     if st.session_state.user['role'] == 'Admin':
