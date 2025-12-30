@@ -12,7 +12,7 @@ from urllib.parse import quote
 from cryptography.fernet import Fernet 
 from PIL import Image, ImageDraw, ImageFont 
 import socket 
-import qrcode 
+import qrcode
 
 # ==========================================
 # 1. CONFIG & STYLING
