@@ -12,7 +12,7 @@ from urllib.parse import quote
 from cryptography.fernet import Fernet 
 from PIL import Image, ImageDraw, ImageFont 
 import socket 
-import qrcode
+import qrcode 
 
 # ==========================================
 # 1. CONFIG & STYLING
@@ -56,7 +56,6 @@ def show_connect_qr():
     st.sidebar.subheader("📱 Connect Mobile/iPad")
     try:
         qr = qrcode.make(url)
-        # Convert QR to image for Streamlit
         img_byte_arr = io.BytesIO()
         qr.save(img_byte_arr, format='PNG')
         st.sidebar.image(img_byte_arr.getvalue(), width=150)
@@ -1005,24 +1004,24 @@ elif menu == "Print Stickers":
     n_sheets = c2.number_input("Number of Sheets (9 stickers/sheet)", 1, value=1)
     
     # 1. BUTTON TO GENERATE
-    if st.button("Generate Sticker PDF", type="primary"):
-        # Generate and Store in Session State
+    if st.button("Generate & Preview Sticker", type="primary"):
         pdf_bytes = generate_pdf_from_images(t_val, n_sheets, st_title, st_cell)
         st.session_state.sticker_pdf = pdf_bytes
-        st.success("✅ Sticker generated successfully! Click below to download.")
+        
+        # PREVIEW IN PAGE
+        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="600" type="application/pdf"></iframe>'
+        st.markdown("### 📄 Sticker Preview")
+        st.markdown(pdf_display, unsafe_allow_html=True)
 
     # 2. SHOW DOWNLOAD BUTTON IF FILE EXISTS
     if 'sticker_pdf' in st.session_state:
         st.download_button(
-            label="⬇️ Click here to Download Sticker PDF",
+            label="⬇️ Download PDF",
             data=st.session_state.sticker_pdf,
             file_name="sticker.pdf",
             mime="application/pdf"
         )
-        # Optional: Show preview iframe (Safe version)
-        b64 = base64.b64encode(st.session_state.sticker_pdf).decode()
-        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="600"></iframe>', unsafe_allow_html=True)
-
 
 elif menu == "Data Inspector":
     if st.session_state.user['role'] == 'Admin':
