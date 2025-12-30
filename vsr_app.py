@@ -395,9 +395,15 @@ def generate_pdf_from_images(thickness_val, num_sheets, title_text, cell_text):
                 
     out_file = "final_stickers.pdf"
     pdf.output(out_file, "F")
-    with open(out_file, "rb") as f: pdf_bytes = f.read()
+    
+    with open(out_file, "rb") as f:
+         pdf_bytes = f.read()
+
+    # --- ADDED DOWNLOAD BUTTON LOGIC HERE ---
+    
     try: os.remove(temp_img_path); os.remove(out_file)
     except: pass
+    
     return pdf_bytes
 
 # ==========================================
@@ -954,15 +960,7 @@ elif menu == "Staff Work":
             tsal = df['total'].sum(); tkg = df['weight'].sum(); tpkts = df['qty'].sum()
             avg_grams = df['grams'].mean(); exp_pkts = int((kg_given*1000)/avg_grams) if avg_grams > 0 else 0
             m1, m2, m3, m4 = st.columns(4)
-            # UPDATED METRICS (Output Weight instead of Expected Packets)
-            total_weight_produced = df['weight'].sum()
-            balance = kg_given - total_weight_produced
-            
-            m1.metric("Salary", f"₹{tsal}")
-            m2.metric("Total Pkts Produced", tpkts)
-            m3.metric("Output Weight", f"{total_weight_produced:.3f} kg")
-            m4.metric("Balance Material", f"{balance:.3f} kg", delta_color="inverse" if balance > 0 else "normal")
-
+            m1.metric("Salary", f"₹{tsal}"); m2.metric("Total Pkts", tpkts); m3.metric("Exp Pkts", f"~{exp_pkts}"); m4.metric("KG Ret", f"{tkg:.2f}", delta=f"{tkg-kg_given:.2f}")
             notes_sw = st.text_input("Notes (Optional)", key="sw_notes")
             if st.button("✅ Save Entry", type="primary", key="sw_confirm"):
                 wid = run_query("INSERT INTO staff_work (date, staff_name, kg_provided, total_salary, notes) VALUES (?,?,?,?,?)", (d, nm, kg_given, tsal, notes_sw))
@@ -1030,9 +1028,21 @@ elif menu == "Print Stickers":
     
     if st.button("Generate Sticker PDF", type="primary"):
         pdf_bytes = generate_pdf_from_images(t_val, n_sheets, st_title, st_cell)
-        b64 = base64.b64encode(pdf_bytes).decode()
-        st.success("PDF Generated Successfully!")
-        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="900"></iframe>', unsafe_allow_html=True)
+        
+        # 1. Base64 Preview
+        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="900" type="application/pdf"></iframe>'
+        
+        st.markdown("### 🖨️ Sticker Preview")
+        st.markdown(pdf_display, unsafe_allow_html=True)
+        
+        # 2. Download Button
+        st.download_button(
+            label="⬇️ Download PDF",
+            data=pdf_bytes,
+            file_name="sticker.pdf",
+            mime="application/pdf"
+        )
     
     st.info("💡 Pro Tip: For perfect Tamil text, you can upload an image of the text named 'title.png' to the app folder.")
 
