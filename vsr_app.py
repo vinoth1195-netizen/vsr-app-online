@@ -5,6 +5,7 @@ from datetime import datetime, date, timedelta
 import io
 from fpdf import FPDF
 import os
+import sys
 import base64
 import hashlib
 import shutil
@@ -13,6 +14,29 @@ from cryptography.fernet import Fernet
 from PIL import Image, ImageDraw, ImageFont 
 import socket 
 import qrcode 
+
+# ==========================================
+# 0. PATH FIXER (FOR EXE)
+# ==========================================
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+def get_db_path(db_filename):
+    """ Ensure DB is stored next to the EXE, not in the temp folder """
+    if getattr(sys, 'frozen', False):
+        # Running as compiled .exe
+        app_path = os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        app_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(app_path, db_filename)
 
 # ==========================================
 # 1. CONFIG & STYLING
@@ -32,9 +56,13 @@ ALL_PAGES = [
 
 # HELPER: Load Image
 def get_base64_of_bin_file(bin_file):
-    with open(bin_file, 'rb') as f:
-        data = f.read()
-    return base64.b64encode(data).decode()
+    # Use resource_path to find the file even inside EXE
+    file_path = resource_path(bin_file)
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        return base64.b64encode(data).decode()
+    return ""
 
 # HELPER: QR & Network
 def get_local_ip():
@@ -56,10 +84,12 @@ def show_connect_qr():
     st.sidebar.subheader("📱 Connect Mobile/iPad")
     try:
         qr = qrcode.make(url)
-        st.sidebar.image(qr.get_image(), width=150)
+        # We don't save to disk to avoid permission issues in Program Files
+        img_byte_arr = io.BytesIO()
+        qr.save(img_byte_arr, format='PNG')
+        st.sidebar.image(img_byte_arr, width=150)
     except:
-        qr = qrcode.make(url)
-        st.sidebar.image(qr, width=150)
+        st.sidebar.warning("QR Gen Failed")
     st.sidebar.caption(f"Scan or type: **{url}**")
 
 # CUSTOM CSS
@@ -91,15 +121,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# LOGIN BG
-if os.path.exists("logo.png") and 'auth' not in st.session_state:
+# LOGIN BG (Updated with resource_path)
+logo_file = resource_path("logo.png")
+if os.path.exists(logo_file) and 'auth' not in st.session_state:
     bin_str = get_base64_of_bin_file("logo.png")
-    st.markdown(f"""<style>.stApp {{ background-image: linear-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.9)), url("data:image/png;base64,{bin_str}"); background-size: 50%; background-position: center; background-repeat: no-repeat; background-attachment: fixed; }}</style>""", unsafe_allow_html=True)
+    if bin_str:
+        st.markdown(f"""<style>.stApp {{ background-image: linear-gradient(rgba(255,255,255,0.9), rgba(255,255,255,0.9)), url("data:image/png;base64,{bin_str}"); background-size: 50%; background-position: center; background-repeat: no-repeat; background-attachment: fixed; }}</style>""", unsafe_allow_html=True)
 
 # ==========================================
 # 2. DATABASE SETUP
 # ==========================================
-DB_FILE = 'vsr_threads_final_v86.db' # Version 86
+# Use get_db_path to ensure DB persists outside the temp folder
+DB_FILE = get_db_path('vsr_threads_final_v91.db') 
 
 def hash_pass(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
@@ -151,12 +184,33 @@ def init_db():
     conn.commit(); conn.close()
 
 def run_query(query, params=(), fetch=False):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row 
-    c = conn.cursor()
-    c.execute(query, params)
-    if fetch: data = c.fetchall(); conn.close(); return data
-    lid = c.lastrowid; conn.commit(); conn.close(); return lid
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row 
+        c = conn.cursor()
+        c.execute(query, params)
+        if fetch: 
+            return c.fetchall() # Returns list of Row objects (or empty list)
+        lid = c.lastrowid
+        conn.commit()
+        return lid
+    except Exception as e:
+        if fetch: return [] # CRITICAL FIX: Return empty list, NEVER None
+        return None
+    finally:
+        if conn: conn.close()
+
+# --- SAFETY HELPER (Fixes TypeError: NoneType is not subscriptable) ---
+def safe_get(data, default=0):
+    """ Safely extracts the first column of the first row from a query result. """
+    # data is expected to be a list of sqlite3.Row objects
+    # if data is None or empty list [], return default
+    if data and len(data) > 0 and data[0]:
+        # data[0] is the first row. data[0][0] is the first column.
+        val = data[0][0]
+        return val if val is not None else default
+    return default
 
 def get_setting(key):
     res = run_query("SELECT value FROM settings WHERE key=?", (key,), fetch=True)
@@ -170,19 +224,20 @@ def encrypt_val(text): return cipher.encrypt(text.encode()).decode()
 def decrypt_val(enc_text): return cipher.decrypt(enc_text.encode()).decode()
 
 def get_stock(item_id, opening):
-    sold = run_query("SELECT SUM(qty) FROM sale_items WHERE item_id=?", (item_id,), fetch=True)[0][0] or 0
-    added = run_query("SELECT SUM(qty_added) FROM stock_logs WHERE item_id=?", (item_id,), fetch=True)[0][0] or 0
+    sold = safe_get(run_query("SELECT SUM(qty) FROM sale_items WHERE item_id=?", (item_id,), fetch=True))
+    added = safe_get(run_query("SELECT SUM(qty_added) FROM stock_logs WHERE item_id=?", (item_id,), fetch=True))
     return opening + added - sold
 
 def get_customer_due(cust_id, opening):
-    inv = run_query("SELECT SUM(grand_total) FROM sales WHERE customer_id=?", (cust_id,), fetch=True)[0][0] or 0
-    pay = run_query("SELECT SUM(amount) FROM payments WHERE customer_id=?", (cust_id,), fetch=True)[0][0] or 0
+    inv = safe_get(run_query("SELECT SUM(grand_total) FROM sales WHERE customer_id=?", (cust_id,), fetch=True))
+    pay = safe_get(run_query("SELECT SUM(amount) FROM payments WHERE customer_id=?", (cust_id,), fetch=True))
     return opening + inv - pay
 
 # --- PDF GENERATORS ---
 def create_pdf(sale, items, customer, gst, addr, phone):
     pdf = FPDF(); pdf.add_page()
-    logo_path = "logo.png"
+    # Use resource_path for logo in PDF
+    logo_path = resource_path("logo.png")
     has_logo = os.path.exists(logo_path)
     if has_logo:
         pdf.image(logo_path, x=60, y=100, w=90); pdf.image(logo_path, x=10, y=8, w=25); pdf.set_xy(10, 35)
@@ -282,19 +337,22 @@ def create_pnl_pdf(d1, d2, rev, cogs, exp_data, net):
     except: pass
     return bytes_data
 
-# --- IMAGE STICKER GENERATOR ---
+# --- IMAGE STICKER GENERATOR (CRASH PROOF) ---
 def create_sticker_image(thickness_val, title_text, cell_number):
     width = 1086; height = 744
     img = Image.new('RGB', (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
     
+    # 1. BORDER
     border_color = (30, 58, 138)
     draw.rectangle([10, 10, width-10, height-10], outline=border_color, width=15)
     
+    # 2. HEADER BG
     header_color = (239, 246, 255)
     draw.rectangle([25, 25, width-25, 180], fill=header_color)
     
-    title_img_path = "title.png"
+    # 3. TITLE (Using resource_path for images/fonts)
+    title_img_path = resource_path("title.png")
     title_drawn = False
     
     if os.path.exists(title_img_path):
@@ -313,11 +371,15 @@ def create_sticker_image(thickness_val, title_text, cell_number):
         except: pass
 
     if not title_drawn:
+        # Fallback to Text
         font_path = None
-        possible = ["Nirmala.ttf", "tamil.ttf", "C:/Windows/Fonts/Nirmala.ttf", "C:/Windows/Fonts/Latha.ttf", "arial.ttf"]
+        # Use resource_path for tamil.ttf
+        possible = [resource_path("tamil.ttf"), resource_path("Nirmala.ttf"), "C:/Windows/Fonts/Nirmala.ttf", "arial.ttf"]
         for p in possible:
             if os.path.exists(p):
-                font_path = p; break
+                font_path = p
+                break
+        
         try:
             if font_path: title_font = ImageFont.truetype(font_path, 80)
             else: title_font = ImageFont.load_default()
@@ -333,9 +395,11 @@ def create_sticker_image(thickness_val, title_text, cell_number):
         except:
             draw.text((100, 75), "Nool Kandu", fill=(0,0,0))
 
-    if os.path.exists("logo.png"):
+    # 4. LOGO
+    logo_path = resource_path("logo.png")
+    if os.path.exists(logo_path):
         try:
-            logo = Image.open("logo.png").convert("RGBA")
+            logo = Image.open(logo_path).convert("RGBA")
             header_end_y = 205; footer_start_y = height - 120 
             available_h = footer_start_y - header_end_y
             target_h = int(available_h * 0.8) 
@@ -373,6 +437,7 @@ def create_sticker_image(thickness_val, title_text, cell_number):
     
     cell_display_text = f"Cell: {cell_number}"
     draw.text((50, height - 120), cell_display_text, font=cell_font, fill=(0,0,0))
+    
     return img
 
 def generate_pdf_from_images(thickness_val, num_sheets, title_text, cell_text):
@@ -395,9 +460,15 @@ def generate_pdf_from_images(thickness_val, num_sheets, title_text, cell_text):
                 
     out_file = "final_stickers.pdf"
     pdf.output(out_file, "F")
-    with open(out_file, "rb") as f: pdf_bytes = f.read()
+    
+    with open(out_file, "rb") as f:
+         pdf_bytes = f.read()
+
+    # --- ADDED DOWNLOAD BUTTON LOGIC HERE ---
+    
     try: os.remove(temp_img_path); os.remove(out_file)
     except: pass
+    
     return pdf_bytes
 
 # ==========================================
@@ -412,7 +483,7 @@ if not st.session_state.user:
     with c2:
         st.markdown("<br><br><br>", unsafe_allow_html=True)
         with st.container(border=True):
-            if os.path.exists("logo.png"): st.image("logo.png", width=120)
+            if os.path.exists(resource_path("logo.png")): st.image(resource_path("logo.png"), width=120)
             st.markdown("<h2 style='text-align:center; color:#1E3A8A'>🔐 VSR Login</h2>", unsafe_allow_html=True)
             u = st.text_input("Username", key="login_user")
             p = st.text_input("Password", type="password", key="login_pass")
@@ -427,7 +498,7 @@ if not st.session_state.user:
     st.stop()
 
 with st.sidebar:
-    if os.path.exists("logo.png"): st.image("logo.png", width=120)
+    if os.path.exists(resource_path("logo.png")): st.image(resource_path("logo.png"), width=120)
     else: st.markdown("<h2>VSR Threads</h2>", unsafe_allow_html=True)
     st.info(f"👤 {st.session_state.user['username']} ({st.session_state.user['role']})")
     
@@ -470,21 +541,26 @@ if menu == "Dashboard":
     if df and dt: wh += " AND date BETWEEN ? AND ?"; p.extend([df, dt])
     if cid: wh += " AND customer_id=?"; p.append(cid)
     
-    sales = run_query(f"SELECT SUM(grand_total) FROM sales {wh}", tuple(p), fetch=True)[0][0] or 0
+    # SAFE QUERY RETRIEVAL USING safe_get()
+    sales = safe_get(run_query(f"SELECT SUM(grand_total) FROM sales {wh}", tuple(p), fetch=True))
+    
     ids = [r[0] for r in run_query(f"SELECT id FROM sales {wh}", tuple(p), fetch=True)]
     cogs = 0
     if ids:
-        ph = ",".join("?"*len(ids)); cogs = run_query(f"SELECT SUM(qty*cost_per_unit) FROM sale_items WHERE sale_id IN ({ph})", tuple(ids), fetch=True)[0][0] or 0
+        ph = ",".join("?"*len(ids))
+        cogs = safe_get(run_query(f"SELECT SUM(qty*cost_per_unit) FROM sale_items WHERE sale_id IN ({ph})", tuple(ids), fetch=True))
+    
     exp = 0
     if cid is None:
         p2 = [df, dt] if df and dt else []; w2 = "WHERE date BETWEEN ? AND ?" if df and dt else ""
-        exp = run_query(f"SELECT SUM(amount) FROM expenses {w2}", tuple(p2), fetch=True)[0][0] or 0
+        exp = safe_get(run_query(f"SELECT SUM(amount) FROM expenses {w2}", tuple(p2), fetch=True))
     
-    taxable_sales = run_query(f"SELECT SUM(sub_total) FROM sales {wh}", tuple(p), fetch=True)[0][0] or 0
+    taxable_sales = safe_get(run_query(f"SELECT SUM(sub_total) FROM sales {wh}", tuple(p), fetch=True))
     
-    all_op = run_query("SELECT SUM(opening_due) FROM customers", fetch=True)[0][0] or 0
-    all_sales = run_query("SELECT SUM(grand_total) FROM sales", fetch=True)[0][0] or 0
-    all_paid = run_query("SELECT SUM(amount) FROM payments", fetch=True)[0][0] or 0
+    all_op = safe_get(run_query("SELECT SUM(opening_due) FROM customers", fetch=True))
+    all_sales = safe_get(run_query("SELECT SUM(grand_total) FROM sales", fetch=True))
+    all_paid = safe_get(run_query("SELECT SUM(amount) FROM payments", fetch=True))
+    
     pending_payments = (all_op + all_sales) - all_paid
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -497,8 +573,8 @@ if menu == "Dashboard":
 
     st.write("#### ⚡ Daily Pulse")
     def day_stat(d):
-        s = run_query("SELECT SUM(grand_total) FROM sales WHERE date=?", (d,), fetch=True)[0][0] or 0
-        e = run_query("SELECT SUM(amount) FROM expenses WHERE date=?", (d,), fetch=True)[0][0] or 0
+        s = safe_get(run_query("SELECT SUM(grand_total) FROM sales WHERE date=?", (d,), fetch=True))
+        e = safe_get(run_query("SELECT SUM(amount) FROM expenses WHERE date=?", (d,), fetch=True))
         return s, e
     ts, te = day_stat(date.today()); ys, ye = day_stat(date.today()-timedelta(days=1))
     d1, d2, d3, d4 = st.columns(4)
@@ -507,17 +583,24 @@ if menu == "Dashboard":
     st.divider()
 
     st.write("#### 🧱 Purchases & Inventory")
-    tp = run_query("SELECT SUM(bags), SUM(total_kg), SUM(total_amount) FROM purchases", fetch=True)[0]
-    tbags = tp[0] or 0; tkg = tp[1] or 0; tamt = tp[2] or 0
-    used_kg = run_query("SELECT SUM(kg_provided) FROM staff_work", fetch=True)[0][0] or 0
+    tp_res = run_query("SELECT SUM(bags), SUM(total_kg), SUM(total_amount) FROM purchases", fetch=True)
+    if tp_res and len(tp_res) > 0 and tp_res[0]:
+        tbags = tp_res[0][0] or 0
+        tkg = tp_res[0][1] or 0
+        tamt = tp_res[0][2] or 0
+    else:
+        tbags=0; tkg=0; tamt=0
+        
+    used_kg = safe_get(run_query("SELECT SUM(kg_provided) FROM staff_work", fetch=True))
     rem_kg = tkg - used_kg
+    
     items = run_query("SELECT * FROM items", fetch=True)
     total_qty = 0; total_val = 0
     if items:
         for i in items:
-            curr_stock = get_stock(i['id'], i['opening_stock'])
-            total_qty += curr_stock
-            total_val += (curr_stock * i['cost_price'])
+            cur = get_stock(i['id'], i['opening_stock'])
+            total_qty += cur
+            total_val += (cur * i['cost_price'])
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Total Bags", tbags)
     m2.metric("Purchased Kg", f"{tkg:.2f}")
@@ -528,25 +611,28 @@ if menu == "Dashboard":
     
     cr = run_query(f"SELECT date, grand_total FROM sales {wh} ORDER BY date", tuple(p), fetch=True)
     c_data = {}
-    for r in cr: c_data[r['date']] = c_data.get(r['date'], 0) + r['grand_total']
+    if cr:
+        for r in cr: c_data[r['date']] = c_data.get(r['date'], 0) + r['grand_total']
     if c_data: st.line_chart(pd.DataFrame(list(c_data.items()), columns=['Date','Sales']).set_index('Date'))
 
     c_l, c_r = st.columns(2)
     with c_l:
         st.subheader("⚠️ Low Stock (<=5)")
         low = []
-        for i in items:
-            cur = get_stock(i['id'], i['opening_stock'])
-            if cur <= 5: low.append({"Item": f"{i['name']} {i['color']}", "Qty": cur})
+        if items:
+            for i in items:
+                cur = get_stock(i['id'], i['opening_stock'])
+                if cur <= 5: low.append({"Item": f"{i['name']} {i['color']}", "Qty": cur})
         if low: st.dataframe(pd.DataFrame(low), hide_index=True, use_container_width=True)
         else: st.success("Stock Healthy")
     with c_r:
         st.subheader("💰 Pending Payments")
         custs = run_query("SELECT id, name, opening_due FROM customers", fetch=True)
         dues = []
-        for c in custs:
-            d = get_customer_due(c['id'], c['opening_due'])
-            if d > 1: dues.append({"Customer": c['name'], "Due": f"₹{d:,.2f}"})
+        if custs:
+            for c in custs:
+                d = get_customer_due(c['id'], c['opening_due'])
+                if d > 1: dues.append({"Customer": c['name'], "Due": f"₹{d:,.2f}"})
         if dues: st.dataframe(pd.DataFrame(dues), hide_index=True, use_container_width=True, column_config={"Due": st.column_config.NumberColumn(format="₹%.2f")})
         else: st.success("No Dues")
 
@@ -586,7 +672,7 @@ elif menu == "Sales & Billing":
                 paid = st.number_input("Paid", 0.0, value=grand, key="sales_paid"); note = st.text_input("Note", key="sales_note")
                 if st.button("✅ Confirm Sale", type="primary", use_container_width=True, key="sales_confirm"):
                     sid = run_query("INSERT INTO sales (date, customer_id, sub_total, cgst_percent, sgst_percent, cgst_amount, sgst_amount, grand_total, paid_amount, notes, walkin_phone) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                              (d_inv, c_id, taxable, cp, sp, taxable*(cp/100), taxable*(sp/100), grand, paid, note, walkin_mob))
+                                      (d_inv, c_id, taxable, cp, sp, taxable*(cp/100), taxable*(sp/100), grand, paid, note, walkin_mob))
                     for x in st.session_state.cart: run_query("INSERT INTO sale_items (sale_id, item_id, qty, price_per_unit, cost_per_unit) VALUES (?,?,?,?,?)", (sid, x['id'], x['qty'], x['price'], x['cost']))
                     if paid > 0: run_query("INSERT INTO payments (date, customer_id, sale_id, amount, note) VALUES (?,?,?,?,?)", (d_inv, c_id, sid, paid, "Sale"))
                     st.session_state.cart = []; st.success("Saved!"); st.rerun()
@@ -611,52 +697,55 @@ elif menu == "Sales & Billing":
             sid = st.selectbox("Select Invoice", [r['id'] for r in sales], key="hist_sel")
             if sid:
                 c1, c2 = st.columns([1.5, 1])
-                inv = run_query("SELECT * FROM sales WHERE id=?", (sid,), fetch=True)[0]
-                its = run_query("SELECT i.name, i.color, si.qty, si.price_per_unit FROM sale_items si JOIN items i ON si.item_id=i.id WHERE si.sale_id=?", (sid,), fetch=True)
-                cdet = run_query("SELECT * FROM customers WHERE id=?", (inv['customer_id'],), fetch=True)[0] if inv['customer_id'] else None
+                inv_data = run_query("SELECT * FROM sales WHERE id=?", (sid,), fetch=True)
+                if inv_data:
+                    inv = inv_data[0]
+                    its = run_query("SELECT i.name, i.color, si.qty, si.price_per_unit FROM sale_items si JOIN items i ON si.item_id=i.id WHERE si.sale_id=?", (sid,), fetch=True)
+                    cdet_data = run_query("SELECT * FROM customers WHERE id=?", (inv['customer_id'],), fetch=True)
+                    cdet = cdet_data[0] if cdet_data else None
                 
-                # GENERATE INVOICE
-                if c1.button("🖨️ Generate Invoice for Print", type="primary", key=f"gen_{sid}"):
-                    pdf_bytes = create_pdf(inv, its, cdet, get_setting('gst_number'), get_setting('business_address'), get_setting('business_contact'))
-                    b64 = base64.b64encode(pdf_bytes).decode()
-                    st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="800"></iframe>', unsafe_allow_html=True)
+                    # GENERATE INVOICE
+                    if c1.button("🖨️ Generate Invoice for Print", type="primary", key=f"gen_{sid}"):
+                        pdf_bytes = create_pdf(inv, its, cdet, get_setting('gst_number'), get_setting('business_address'), get_setting('business_contact'))
+                        b64 = base64.b64encode(pdf_bytes).decode()
+                        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="800"></iframe>', unsafe_allow_html=True)
 
-                # WHATSAPP BUTTON LOGIC
-                target_phone = inv['walkin_phone'] if not cdet else cdet['phone']
-                if target_phone:
-                    cname_str = cdet['name'] if cdet else "Customer"
-                    msg = f"*🧾 INVOICE: #{inv['id']}*\n"
-                    msg += f"📅 Date: {inv['date']}\n"
-                    msg += f"👤 Customer: {cname_str}\n"
-                    msg += "------------------------------\n"
-                    msg += "*Item Details:*\n"
-                    for item in its:
-                         iname = item['name'] if 'name' in item.keys() else 'Item'
-                         clr = item['color'] if 'color' in item.keys() else ''
-                         tot_line = item['qty'] * item['price_per_unit']
-                         msg += f"• {iname} {clr} (x{item['qty']}): ₹{tot_line:,.0f}\n"
-                    msg += "------------------------------\n"
-                    msg += f"*GRAND TOTAL: ₹{inv['grand_total']:,.0f}*\n"
-                    msg += "------------------------------\n"
-                    msg += "Thank you for shopping with VSR Threads! 🙏"
-                    
-                    encoded_msg = quote(msg)
-                    wa_link = f"https://wa.me/91{target_phone}?text={encoded_msg}"
-                    c2.link_button(f"💬 Open WhatsApp ({target_phone})", wa_link)
-                    c2.caption("*Click to open WhatsApp web, then drag & drop the downloaded PDF.*")
-                else:
-                    c2.info("No phone number found for this invoice.")
+                    # WHATSAPP BUTTON LOGIC
+                    target_phone = inv['walkin_phone'] if not cdet else cdet['phone']
+                    if target_phone:
+                        cname_str = cdet['name'] if cdet else "Customer"
+                        msg = f"*🧾 INVOICE: #{inv['id']}*\n"
+                        msg += f"📅 Date: {inv['date']}\n"
+                        msg += f"👤 Customer: {cname_str}\n"
+                        msg += "------------------------------\n"
+                        msg += "*Item Details:*\n"
+                        for item in its:
+                             iname = item['name'] if 'name' in item.keys() else 'Item'
+                             clr = item['color'] if 'color' in item.keys() else ''
+                             tot_line = item['qty'] * item['price_per_unit']
+                             msg += f"• {iname} {clr} (x{item['qty']}): ₹{tot_line:,.0f}\n"
+                        msg += "------------------------------\n"
+                        msg += f"*GRAND TOTAL: ₹{inv['grand_total']:,.0f}*\n"
+                        msg += "------------------------------\n"
+                        msg += "Thank you for shopping with VSR Threads! 🙏"
+                        
+                        encoded_msg = quote(msg)
+                        wa_link = f"https://wa.me/91{target_phone}?text={encoded_msg}"
+                        c2.link_button(f"💬 Open WhatsApp ({target_phone})", wa_link)
+                        c2.caption("*Click to open WhatsApp web, then drag & drop the downloaded PDF.*")
+                    else:
+                        c2.info("No phone number found for this invoice.")
 
-                due = inv['grand_total'] - inv['paid_amount']
-                if due > 0.01:
-                    pay_now = c2.number_input(f"Receive Payment (Bal: ₹{due:.2f})", 0.0, value=float(due), key="pay_due_amt")
-                    if c2.button("Update Payment", key="pay_due_btn"):
-                        run_query("UPDATE sales SET paid_amount=? WHERE id=?", (inv['paid_amount']+pay_now, sid))
-                        run_query("INSERT INTO payments (date, customer_id, sale_id, amount, note) VALUES (?,?,?,?,?)", (date.today(), inv['customer_id'], sid, pay_now, "Balance Recd"))
-                        st.success("Updated!"); st.rerun()
-                if st.button("Delete Invoice", key="del_inv"):
-                    run_query("DELETE FROM sales WHERE id=?", (sid,)); run_query("DELETE FROM sale_items WHERE sale_id=?", (sid,)); run_query("DELETE FROM payments WHERE sale_id=?", (sid,))
-                    st.warning("Deleted"); st.rerun()
+                    due = inv['grand_total'] - inv['paid_amount']
+                    if due > 0.01:
+                        pay_now = c2.number_input(f"Receive Payment (Bal: ₹{due:.2f})", 0.0, value=float(due), key="pay_due_amt")
+                        if c2.button("Update Payment", key="pay_due_btn"):
+                            run_query("UPDATE sales SET paid_amount=? WHERE id=?", (inv['paid_amount']+pay_now, sid))
+                            run_query("INSERT INTO payments (date, customer_id, sale_id, amount, note) VALUES (?,?,?,?,?)", (date.today(), inv['customer_id'], sid, pay_now, "Balance Recd"))
+                            st.success("Updated!"); st.rerun()
+                    if st.button("Delete Invoice", key="del_inv"):
+                        run_query("DELETE FROM sales WHERE id=?", (sid,)); run_query("DELETE FROM sale_items WHERE sale_id=?", (sid,)); run_query("DELETE FROM payments WHERE sale_id=?", (sid,))
+                        st.warning("Deleted"); st.rerun()
         else: st.info("No sales history.")
 
 elif menu == "Inventory Items":
@@ -665,20 +754,22 @@ elif menu == "Inventory Items":
     # ----------------------------------------------------
     
     # 1. METRICS DASHBOARD
-    tot_items = run_query("SELECT COUNT(*) FROM items", fetch=True)[0][0] or 0
-    tot_stock = run_query("SELECT SUM(CASE WHEN (opening_stock + (SELECT COALESCE(SUM(qty_added),0) FROM stock_logs WHERE item_id=items.id) - (SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE item_id=items.id)) < 0 THEN 0 ELSE (opening_stock + (SELECT COALESCE(SUM(qty_added),0) FROM stock_logs WHERE item_id=items.id) - (SELECT COALESCE(SUM(qty),0) FROM sale_items WHERE item_id=items.id)) END) FROM items", fetch=True)[0][0] or 0
-    # Approx Value logic
-    tot_val = 0
+    tot_items_res = run_query("SELECT COUNT(*) FROM items", fetch=True)
+    tot_items = tot_items_res[0][0] if tot_items_res and tot_items_res[0][0] else 0
+    
+    # Simple approx logic for dashboard metric
     all_items = run_query("SELECT * FROM items", fetch=True)
+    total_qty = 0; total_val = 0
     if all_items:
         for i in all_items:
             cur = get_stock(i['id'], i['opening_stock'])
-            tot_val += (cur * i['cost_price'])
+            total_qty += cur
+            total_val += (cur * i['cost_price'])
     
     m1, m2, m3 = st.columns(3)
     m1.metric("Total Unique Items", tot_items)
-    m2.metric("Total Stock Qty", tot_stock)
-    m3.metric("Inventory Value (Cost)", f"₹{tot_val:,.0f}")
+    m2.metric("Total Stock Qty", total_qty)
+    m3.metric("Inventory Value (Cost)", f"₹{total_val:,.0f}")
     st.divider()
 
     # 2. TABS
@@ -771,7 +862,11 @@ elif menu == "Inventory Items":
                 
                 # RETRIEVE BUTTON ADDED HERE
                 if st.button("⬇️ Retrieve Details", key="inv_retr_btn"):
-                    st.session_state.edit_inv_data = run_query("SELECT * FROM items WHERE id=?", (sel_id,), fetch=True)[0]
+                    inv_res = run_query("SELECT * FROM items WHERE id=?", (sel_id,), fetch=True)
+                    if inv_res:
+                          st.session_state.edit_inv_data = inv_res[0]
+                    else:
+                        st.error("Item not found.")
 
                 if 'edit_inv_data' in st.session_state and st.session_state.edit_inv_data and st.session_state.edit_inv_data['id'] == sel_id:
                     item_det = st.session_state.edit_inv_data
@@ -839,8 +934,8 @@ elif menu == "Purchases":
             fn = p_file.name if p_file else None
             
             run_query("""INSERT INTO purchases (date, description, bags, kg_per_bag, total_kg, price_per_kg, total_amount, 
-                         vendor_name, vendor_contact, is_gst, cgst_percent, sgst_percent, bill_file, bill_filename) 
-                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
+                          vendor_name, vendor_contact, is_gst, cgst_percent, sgst_percent, bill_file, bill_filename) 
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", 
                       (d, desc, bags, kg, total_kg, rate, total_amt, vname, vcontact, 1 if is_gst else 0, cgst_p, sgst_p, fb, fn))
             st.rerun()
 
@@ -895,7 +990,11 @@ elif menu == "Expenses":
             
             # RETRIEVE BUTTON ADDED
             if st.button("⬇️ Retrieve Details", key="exp_retr_btn"):
-                 st.session_state.edit_exp_data = run_query("SELECT * FROM expenses WHERE id=?", (eid,), fetch=True)[0]
+                 exp_res = run_query("SELECT * FROM expenses WHERE id=?", (eid,), fetch=True)
+                 if exp_res:
+                    st.session_state.edit_exp_data = exp_res[0]
+                 else:
+                    st.error("Expense not found.")
             
             if 'edit_exp_data' in st.session_state and st.session_state.edit_exp_data and st.session_state.edit_exp_data['id'] == eid:
                 e_dat = st.session_state.edit_exp_data
@@ -921,7 +1020,11 @@ elif menu == "Customers":
             
             # RETRIEVE BUTTON ADDED
             if st.button("⬇️ Retrieve Details", key="cust_retr_btn"):
-                 st.session_state.edit_cust_data = run_query("SELECT * FROM customers WHERE id=?", (cid,), fetch=True)[0]
+                 cust_res = run_query("SELECT * FROM customers WHERE id=?", (cid,), fetch=True)
+                 if cust_res:
+                    st.session_state.edit_cust_data = cust_res[0]
+                 else:
+                    st.error("Customer not found.")
                  
             if 'edit_cust_data' in st.session_state and st.session_state.edit_cust_data and st.session_state.edit_cust_data['id'] == cid:
                 c = st.session_state.edit_cust_data
@@ -995,7 +1098,11 @@ elif menu == "Staff Work":
             
             # RETRIEVE BUTTON ADDED
             if st.button("⬇️ Retrieve Details", key="sw_retr_btn"):
-                 st.session_state.edit_sw_data = run_query("SELECT * FROM staff_work WHERE id=?", (did,), fetch=True)[0]
+                 sw_res = run_query("SELECT * FROM staff_work WHERE id=?", (did,), fetch=True)
+                 if sw_res:
+                    st.session_state.edit_sw_data = sw_res[0]
+                 else:
+                    st.error("Entry not found.")
             
             if 'edit_sw_data' in st.session_state and st.session_state.edit_sw_data and st.session_state.edit_sw_data['id'] == did:
                 dets = run_query("SELECT COALESCE(swi.item_name, i.name, 'Generic') as name, swi.grams, swi.qty_produced, swi.rate, swi.amount FROM staff_work_items swi LEFT JOIN items i ON swi.item_id=i.id WHERE swi.work_id=?", (did,), fetch=True)
@@ -1030,9 +1137,21 @@ elif menu == "Print Stickers":
     
     if st.button("Generate Sticker PDF", type="primary"):
         pdf_bytes = generate_pdf_from_images(t_val, n_sheets, st_title, st_cell)
-        b64 = base64.b64encode(pdf_bytes).decode()
-        st.success("PDF Generated Successfully!")
-        st.markdown(f'<iframe src="data:application/pdf;base64,{b64}" width="100%" height="900"></iframe>', unsafe_allow_html=True)
+        
+        # 1. Base64 Preview
+        base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="900" type="application/pdf"></iframe>'
+        
+        st.markdown("### 🖨️ Sticker Preview")
+        st.markdown(pdf_display, unsafe_allow_html=True)
+        
+        # 2. Download Button
+        st.download_button(
+            label="⬇️ Download PDF",
+            data=pdf_bytes,
+            file_name="sticker.pdf",
+            mime="application/pdf"
+        )
     
     st.info("💡 Pro Tip: For perfect Tamil text, you can upload an image of the text named 'title.png' to the app folder.")
 
@@ -1169,9 +1288,10 @@ elif menu == "Reports":
         q_dues = f"SELECT id, name, phone, opening_due FROM customers {cust_where}"
         custs_data = run_query(q_dues, tuple(cust_params), fetch=True)
         res = []
-        for c in custs_data:
-            due = get_customer_due(c['id'], c['opening_due'])
-            if due > 1: res.append({"Name": c['name'], "Phone": c['phone'], "Current Due": due})
+        if custs_data:
+            for c in custs_data:
+                due = get_customer_due(c['id'], c['opening_due'])
+                if due > 1: res.append({"Name": c['name'], "Phone": c['phone'], "Current Due": due})
         if res: st.dataframe(pd.DataFrame(res), column_config={"Current Due": st.column_config.NumberColumn(format="₹%.2f")})
         else: st.info("No dues found.")
 
@@ -1197,9 +1317,9 @@ elif menu == "Reports":
         if cid: st.info("Not applicable for specific Customer filter")
         else:
             q_logs = f'''SELECT sl.date, i.name, i.color, sl.qty_added, sl.notes 
-                         FROM stock_logs sl 
-                         JOIN items i ON sl.item_id=i.id 
-                         {date_filter.replace('date', 'sl.date')} ORDER BY sl.date DESC'''
+                          FROM stock_logs sl 
+                          JOIN items i ON sl.item_id=i.id 
+                          {date_filter.replace('date', 'sl.date')} ORDER BY sl.date DESC'''
             logs = run_query(q_logs, tuple(date_params), fetch=True)
             if logs: st.dataframe(pd.DataFrame([dict(r) for r in logs]))
             else: st.info("No stock logs.")
@@ -1216,20 +1336,21 @@ elif menu == "Reports":
             title = f"({df} to {dt})" if is_date_filtered else "(Overall)"
             st.markdown(f"### 📈 Profit & Loss {title}")
 
-            rev = run_query(f"SELECT SUM(sub_total) FROM sales {pnl_where}", tuple(pnl_params), fetch=True)[0][0] or 0
+            rev = safe_get(run_query(f"SELECT SUM(sub_total) FROM sales {pnl_where}", tuple(pnl_params), fetch=True))
             
             sale_ids_query = f"SELECT id FROM sales {pnl_where}"
             sale_ids_rows = run_query(sale_ids_query, tuple(pnl_params), fetch=True)
-            sale_ids = [row[0] for row in sale_ids_rows]
             
             cogs = 0
-            if sale_ids:
-                placeholders = ",".join("?" * len(sale_ids))
-                cogs_q = f"SELECT SUM(qty * cost_per_unit) FROM sale_items WHERE sale_id IN ({placeholders})"
-                cogs = run_query(cogs_q, tuple(sale_ids), fetch=True)[0][0] or 0
+            if sale_ids_rows:
+                sale_ids = [row[0] for row in sale_ids_rows]
+                if sale_ids:
+                    placeholders = ",".join("?" * len(sale_ids))
+                    cogs_q = f"SELECT SUM(qty * cost_per_unit) FROM sale_items WHERE sale_id IN ({placeholders})"
+                    cogs = safe_get(run_query(cogs_q, tuple(sale_ids), fetch=True))
 
             exp_rows = run_query(f"SELECT category, SUM(amount) as total FROM expenses {pnl_where} GROUP BY category", tuple(pnl_params), fetch=True)
-            tot_exp = sum([r['total'] for r in exp_rows])
+            tot_exp = sum([r['total'] for r in exp_rows]) if exp_rows else 0
             
             net = (rev - cogs) - tot_exp
             
@@ -1249,10 +1370,13 @@ elif menu == "Reports":
             col_a, col_b = st.columns(2)
             d1_pdf = df if is_date_filtered else date(2020,1,1)
             d2_pdf = dt if is_date_filtered else date.today()
-            pdf_bytes = create_pnl_pdf(d1_pdf, d2_pdf, rev, cogs, exp_rows, net)
+            pdf_exp = exp_rows if exp_rows else []
+            pdf_bytes = create_pnl_pdf(d1_pdf, d2_pdf, rev, cogs, pdf_exp, net)
             col_a.download_button("📄 Download PDF Statement", pdf_bytes, "PnL_Statement.pdf", "application/pdf")
+            
             csv_data = [{"Category": "Revenue", "Amount": rev}, {"Category": "COGS", "Amount": -cogs}, {"Category": "Gross Profit", "Amount": rev-cogs}]
-            for r in exp_rows: csv_data.append({"Category": f"Exp: {r['category']}", "Amount": -r['total']})
+            if exp_rows:
+                for r in exp_rows: csv_data.append({"Category": f"Exp: {r['category']}", "Amount": -r['total']})
             csv_data.append({"Category": "NET PROFIT", "Amount": net})
             col_b.download_button("📊 Download Excel (CSV)", pd.DataFrame(csv_data).to_csv(index=False), "PnL.csv")
 
@@ -1261,9 +1385,11 @@ elif menu == "Settings":
     with st.container(border=True):
         st.subheader("Config")
         gst = st.text_input("GST", get_setting("gst_number"), key="set_gst")
+        # --- FIXED: Removed min_value constraint ---
         c = st.number_input("CGST %", value=float(get_setting("cgst_percent")), step=0.1, key="set_cgst")
         s = st.number_input("SGST %", value=float(get_setting("sgst_percent")), step=0.1, key="set_sgst")
         ba = st.text_area("Address", get_setting("business_address"), key="set_addr")
+        # --- ADDED: Business Contact Field ---
         bc = st.text_input("Business Contact", get_setting("business_contact"), key="set_contact")
         
         if st.button("Save", key="set_save"): 
